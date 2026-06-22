@@ -27,8 +27,9 @@ from flask_cors import CORS
 IMAGE_DIRS   = [Path(__file__).parent.parent / "fashion-images"]
 INDEX_PATH   = Path("fashion_clip.index")
 PATHS_PATH   = Path("fashion_clip_paths.npy")
-URL_MAP_PATH = Path("url_map.json")
-MAX_K        = 500
+URL_MAP_PATH        = Path("url_map.json")
+DESIGN_TAGS_PATH    = Path("design_tags.json")
+MAX_K               = 500
 
 # ── R2 public base URL ────────────────────────────────────────────────────────
 R2_BASE_URL = "https://pub-cac4bbcad35d42c6bdb038e52755c31c.r2.dev"
@@ -50,6 +51,15 @@ if URL_MAP_PATH.exists():
     print(f"Loaded url_map.json — {len(url_map)} entries.")
 else:
     print("No url_map.json found — metadata will fall back to filenames.")
+
+# ── Load design tags ───────────────────────────────────────────────────────────
+design_tags: dict = {}
+if DESIGN_TAGS_PATH.exists():
+    with open(DESIGN_TAGS_PATH, encoding="utf-8") as f:
+        design_tags = json.load(f)
+    print(f"Loaded design_tags.json — {len(design_tags)} entries.")
+else:
+    print("Warning: design_tags.json not found — tag filtering disabled.")
 
 # ── Load CLIP ─────────────────────────────────────────────────────────────────
 CLIP_LOADED  = False
@@ -221,8 +231,9 @@ def _parallel_colors(indices: list[int], region: str) -> list[str | None]:
 
 # ── Search strategies ─────────────────────────────────────────────────────────
 
-def _semantic_search(query: str, k: int) -> list[dict]:
-    """Encode the query with CLIP and return top-k FAISS nearest neighbours."""
+def _semantic_search(query: str, k: int, filters: dict | None = None) -> list[dict]:
+    """Encode the query with CLIP and return top-k FAISS nearest neighbours,
+    optionally filtered by design_tags constraints."""
     import clip as openai_clip
     region    = _query_region(query)
     tokens    = openai_clip.tokenize([query]).to(clip_device)
@@ -231,18 +242,25 @@ def _semantic_search(query: str, k: int) -> list[dict]:
     feat      = feat / feat.norm(dim=-1, keepdim=True)
     query_vec = feat.cpu().numpy().astype(np.float32)
 
-    k_actual  = min(k, int(index.ntotal))
-    D, I      = index.search(query_vec, k_actual)
+    # Fetch more candidates when filtering so we still return k results
+    fetch_k   = min(MAX_K, int(index.ntotal))
+    D, I      = index.search(query_vec, fetch_k)
 
     # Deduplicate while preserving FAISS rank order
-    valid, seen = [], set()
+    pid_to_idx: dict[str, int] = {}
     for idx in I[0]:
         if idx < 0 or idx >= len(paths): continue
         pid = _pid(str(paths[idx]))
-        if pid not in seen:
-            seen.add(pid)
-            valid.append(int(idx))
+        if pid not in pid_to_idx:
+            pid_to_idx[pid] = int(idx)
 
+    ranked_pids = list(pid_to_idx.keys())
+
+    if filters:
+        ranked_pids = _filter_by_tags(ranked_pids, filters)
+
+    ranked_pids = ranked_pids[:k]
+    valid  = [pid_to_idx[p] for p in ranked_pids]
     colors = _parallel_colors(valid, region)
     return [_build_result(idx, col) for idx, col in zip(valid, colors)]
 
@@ -319,6 +337,228 @@ def _keyword_search(query: str, k: int) -> list[dict]:
     return [_build_result(idx, col) for idx, col in zip(valid, colors)]
 
 
+# ── Tag-based filtering ───────────────────────────────────────────────────────
+
+# All known query-term → filter-key mappings, sorted longest-first so
+# "high rise" matches before "rise", "off-the-shoulder" before "shoulder", etc.
+_QUERY_MAP: list[tuple[str, str, str]] = sorted([
+    # category aliases (singular/plural)
+    ("dresses", "category", "Dresses"), ("dress", "category", "Dresses"),
+    ("tops", "category", "Tops"), ("top", "category", "Tops"),
+    ("bottoms", "category", "Bottoms"),
+    ("outerwear", "category", "Outerwear"),
+    ("swimwear", "category", "Swimwear"),
+    ("shoes", "category", "Shoes"),
+    ("jewelry", "category", "Jewelry"),
+    ("bags", "category", "Bags"),
+    ("headwear", "category", "Headwear"),
+    ("bras", "category", "Bras"), ("bra", "category", "Bras"),
+    ("underwear", "category", "Underwear"),
+    ("socks", "category", "Socks"),
+    ("ties", "category", "Ties"),
+    ("one-piece", "category", "One-Piece"),
+    # product_type
+    ("t-shirt", "product_type", "T-shirt"), ("tshirt", "product_type", "T-shirt"),
+    ("tank top", "product_type", "Tank top"),
+    ("camisole", "product_type", "Camisole"),
+    ("blouse", "product_type", "Blouse"),
+    ("polo", "product_type", "Polo"),
+    ("sweater", "product_type", "Sweater"),
+    ("cardigan", "product_type", "Cardigan"),
+    ("hoodie", "product_type", "Hoodie"),
+    ("sweatshirt", "product_type", "Sweatshirt"),
+    ("bodysuit", "product_type", "Bodysuit"),
+    ("tunic", "product_type", "Tunic"),
+    ("vest", "product_type", "Vest"),
+    ("jeans", "product_type", "Jeans"),
+    ("pants", "product_type", "Pants"),
+    ("shorts", "product_type", "Shorts"),
+    ("skirt", "product_type", "Skirt"),
+    ("leggings", "product_type", "Leggings"),
+    ("joggers", "product_type", "Joggers"),
+    ("sweatpants", "product_type", "Sweatpants"),
+    ("jacket", "product_type", "Jacket"),
+    ("coat", "product_type", "Coat"),
+    ("blazer", "product_type", "Blazer"),
+    ("trench coat", "product_type", "Trench coat"),
+    ("puffer", "product_type", "Puffer"),
+    ("windbreaker", "product_type", "Windbreaker"),
+    ("jumpsuit", "product_type", "Jumpsuit"),
+    ("romper", "product_type", "Romper"),
+    ("overalls", "product_type", "Overalls"),
+    ("bikini", "product_type", "Bikini"),
+    ("sneakers", "product_type", "Sneakers"),
+    ("sandals", "product_type", "Sandals"),
+    ("boots", "product_type", "Boots"),
+    ("heels", "product_type", "Heels"),
+    ("flats", "product_type", "Flats"),
+    ("loafers", "product_type", "Loafers"),
+    ("handbag", "product_type", "Handbag"),
+    ("backpack", "product_type", "Backpack"),
+    ("clutch", "product_type", "Clutch"),
+    ("hat", "product_type", "Hats"), ("hats", "product_type", "Hats"),
+    ("beanie", "design", "Beanie"),
+    ("fedora", "design", "Fedora"),
+    ("baseball cap", "design", "Baseball cap"),
+    ("bucket hat", "design", "Bucket hat"),
+    # design.length
+    ("floor length", "design.length", "Floor length"),
+    ("tunic length", "design.length", "Tunic length"),
+    ("waist length", "design.length", "Waist length"),
+    ("hip length", "design.length", "Hip length"),
+    ("midi", "design.length", "Midi"),
+    ("maxi", "design.length", "Maxi"),
+    ("mini", "design.length", "Mini"),
+    ("micro", "design.length", "Micro"),
+    ("cropped", "design.length", "Cropped"),
+    # design.fit
+    ("bodycon", "design.fit", "Bodycon"),
+    ("a-line", "design.fit", "A-line"),
+    ("mermaid", "design.fit", "Mermaid"),
+    ("oversized", "design.fit", "Oversized"),
+    ("fitted", "design.fit", "Fitted"),
+    ("relaxed fit", "design.fit", "Relaxed"),
+    ("wide-leg", "design.fit", "Wide-leg"),
+    ("wide leg", "design.fit", "Wide-leg"),
+    ("straight leg", "design.fit", "Straight"),
+    ("skinny", "design.fit", "Skinny"),
+    ("slim fit", "design.fit", "Slim"),
+    ("bootcut", "design.fit", "Bootcut"),
+    ("flare", "design.fit", "Flare"),
+    ("mom jeans", "design.fit", "Mom fit"),
+    ("mom fit", "design.fit", "Mom fit"),
+    ("boyfriend", "design.fit", "Boyfriend"),
+    ("baggy", "design.fit", "Baggy"),
+    ("slip dress", "design.fit", "Slip"), ("slip", "design.fit", "Slip"),
+    ("wrap dress", "design.fit", "Wrap"), ("wrap", "design.fit", "Wrap"),
+    # design.neckline
+    ("off-the-shoulder", "design.neckline", "Off-the-shoulder"),
+    ("off the shoulder", "design.neckline", "Off-the-shoulder"),
+    ("one shoulder", "design.neckline", "One shoulder"),
+    ("turtleneck", "design.neckline", "Turtleneck"),
+    ("mock neck", "design.neckline", "Mock neck"),
+    ("button-down", "design.neckline", "Button-down"),
+    ("v-neck", "design.neckline", "V-neck"), ("vneck", "design.neckline", "V-neck"),
+    ("crewneck", "design.neckline", "Crewneck"),
+    ("halter", "design.neckline", "Halter"),
+    ("plunge", "design.neckline", "Plunge"),
+    ("scoop neck", "design.neckline", "Scoop"),
+    ("square neck", "design.neckline", "Square"),
+    ("boat neck", "design.neckline", "Boat"),
+    # design.sleeve_length
+    ("long sleeve", "design.sleeve_length", "Long sleeve"),
+    ("short sleeve", "design.sleeve_length", "Short sleeve"),
+    ("sleeveless", "design.sleeve_length", "No sleeve"),
+    ("three-quarter sleeve", "design.sleeve_length", "Three-quarter sleeve"),
+    # design.rise
+    ("high rise", "design.rise", "High rise"),
+    ("mid rise", "design.rise", "Mid rise"),
+    ("low rise", "design.rise", "Ultra low rise"),
+    # pattern
+    ("animal print", "pattern", "Animal print"),
+    ("polka dot", "pattern", "Polka dot"),
+    ("camouflage", "pattern", "Camouflage"),
+    ("geometric", "pattern", "Geometric"),
+    ("abstract", "pattern", "Abstract"),
+    ("paisley", "pattern", "Paisley"),
+    ("checkered", "pattern", "Checkered"),
+    ("floral", "pattern", "Floral"),
+    ("striped", "pattern", "Striped"),
+    ("graphic", "pattern", "Graphic"),
+    ("plaid", "pattern", "Plaid"),
+    ("solid", "pattern", "Solid"),
+    # occasion
+    ("activewear", "occasion", "Activewear"),
+    ("business casual", "occasion", "Business Casual"),
+    ("business formal", "occasion", "Business Formal"),
+    ("semi-formal", "occasion", "Semi-Formal"),
+    ("black tie", "occasion", "Black Tie"),
+    ("white tie", "occasion", "White Tie"),
+    ("cocktail", "occasion", "Cocktail"),
+    ("formal", "occasion", "Formal"),
+    ("casual", "occasion", "Casual"),
+    # material
+    ("denim", "material", "denim"),
+    ("linen", "material", "linen"),
+    ("leather", "material", "leather"),
+    ("lace", "material", "lace"),
+    ("satin", "material", "satin"),
+    ("velvet", "material", "velvet"),
+    ("cashmere", "material", "cashmere"),
+    ("silk", "material", "silk"),
+    ("wool", "material", "wool"),
+    ("cotton", "material", "cotton"),
+    ("polyester", "material", "polyester"),
+    ("knit", "material", "knit"),
+    ("sheer", "material", "sheer"),
+    ("corduroy", "material", "corduroy"),
+    ("crochet", "material", "crochet"),
+    # gender
+    ("women's", "gender", "Women"), ("womens", "gender", "Women"),
+    ("women", "gender", "Women"), ("womenswear", "gender", "Women"),
+    ("men's", "gender", "Men"), ("mens", "gender", "Men"),
+    ("men", "gender", "Men"), ("menswear", "gender", "Men"),
+    ("unisex", "gender", "Unisex"),
+], key=lambda x: len(x[0]), reverse=True)
+
+
+def _parse_query_filters(query: str) -> dict[str, str]:
+    """Extract tag filter constraints from a free-text query."""
+    q = query.lower()
+    filters: dict[str, str] = {}
+    for term, key, value in _QUERY_MAP:
+        if term in q and key not in filters:
+            filters[key] = value
+    return filters
+
+
+def _match_tag(tags: dict, key: str, value: str) -> bool:
+    """Check whether a single filter key/value matches a tags entry."""
+    if key in ("category", "product_type", "pattern", "material", "gender"):
+        return tags.get(key) == value
+
+    if key == "occasion":
+        occ = tags.get("occasion", [])
+        return value in occ if isinstance(occ, list) else occ == value
+
+    if key.startswith("design."):
+        sub = key[len("design."):]
+        design = tags.get("design")
+        if not isinstance(design, dict):
+            return False
+        field = design.get(sub)
+        if field is None:
+            return False
+        if isinstance(field, list):
+            return value in field
+        return field == value
+
+    if key == "design":
+        design = tags.get("design")
+        if isinstance(design, list):
+            return value in design
+        if isinstance(design, str):
+            return design == value
+        return False
+
+    return False
+
+
+def _filter_by_tags(pids: list[str], filters: dict[str, str]) -> list[str]:
+    """Return the subset of pids that satisfy all active filters, preserving order."""
+    if not filters or not design_tags:
+        return pids
+    result = []
+    for pid in pids:
+        tags = design_tags.get(pid)
+        if tags is None:
+            result.append(pid)
+            continue
+        if all(_match_tag(tags, k, v) for k, v in filters.items()):
+            result.append(pid)
+    return result
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/health")
@@ -338,10 +578,21 @@ def search():
     if not query:
         return jsonify([])
 
+    # Parse filters from query text, then let explicit params override
+    filters = _parse_query_filters(query)
+    for param in ("category", "product_type", "pattern", "material", "occasion", "gender"):
+        val = request.args.get(param, "").strip()
+        if val:
+            filters[param] = val
+
     if CLIP_LOADED:
-        results = _semantic_search(query, k)
+        results = _semantic_search(query, k, filters or None)
     else:
         results = _keyword_search(query.lower(), k)
+        if filters and design_tags:
+            pids = [r["id"] for r in results]
+            filtered_pids = set(_filter_by_tags(pids, filters))
+            results = [r for r in results if r["id"] in filtered_pids]
 
     return jsonify(results)
 
