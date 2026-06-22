@@ -221,16 +221,7 @@ def _build_result(faiss_idx: int, color: str | None = None) -> dict:
         "price":     meta.get("price"),
         "link":      meta.get("link"),
         "color":     color or meta.get("color"),
-        "tags": {
-            "category":     dtags.get("category"),
-            "product_type": dtags.get("product_type"),
-            "design":       dtags.get("design"),
-            "color":        dtags.get("color"),
-            "material":     dtags.get("material"),
-            "pattern":      dtags.get("pattern"),
-            "occasion":     dtags.get("occasion"),
-            "gender":       dtags.get("gender"),
-        } if dtags else {},
+        "tags": dict(dtags),
     }
 
 
