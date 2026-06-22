@@ -14,7 +14,6 @@ If CLIP fails to load, the server falls back to simple keyword matching.
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -91,108 +90,6 @@ app = Flask(__name__)
 CORS(app, origins="*")
 
 
-# ── Color classifier ──────────────────────────────────────────────────────────
-
-# Garment keywords → which vertical region to sample
-_LOWER_TERMS = {"shorts", "pants", "jeans", "skirt", "trousers", "leggings",
-                "joggers", "chinos", "culottes", "bermuda", "capris", "sweatpants"}
-_UPPER_TERMS = {"top", "shirt", "jacket", "blouse", "sweater", "hoodie",
-                "cardigan", "coat", "tee", "polo", "blazer", "vest",
-                "tank", "pullover", "camisole", "bra", "crop"}
-
-def _query_region(query: str) -> str:
-    words = set(query.lower().split())
-    if words & _LOWER_TERMS: return "lower"
-    if words & _UPPER_TERMS: return "upper"
-    return "full"
-
-
-def _classify_pixel(r: int, g: int, b: int) -> str:
-    mx, mn = max(r, g, b), min(r, g, b)
-    l = (mx + mn) / 2
-    diff = mx - mn
-
-    # Beige/cream/sand: checked before the grey branch so low-diff warm neutrals
-    # are not swallowed by grey/white.
-    if l > 200 and 10 <= r - b <= 30 and (mx == 0 or diff / mx < 0.15):
-        return "beige"
-
-    if diff < 30:
-        if l < 60:  return "black"
-        if l > 195: return "white"
-        return "grey"
-
-    if mx == r:   h = ((g - b) / diff % 6) * 60
-    elif mx == g: h = ((b - r) / diff + 2) * 60
-    else:         h = ((r - g) / diff + 4) * 60
-
-    if h < 20 or h >= 340: return "red"
-    if h < 45:  return "orange"
-    if h < 70:  return "yellow"
-    if h < 160: return "green"
-    if h < 200: return "cyan"
-    if h < 260: return "blue"
-    if h < 290: return "purple"
-    return "pink"
-
-
-def _compute_color(filename: str, region: str) -> str | None:
-    """Fetch image from R2 and compute its dominant garment colour."""
-    import io
-    import requests as req_lib
-    pid = Path(filename).stem
-    url = f"{R2_BASE_URL}/{pid}.jpg"
-    try:
-        resp = req_lib.get(url, timeout=5)
-        resp.raise_for_status()
-        W, H = 40, 60
-        img = Image.open(io.BytesIO(resp.content)).convert("RGB").resize((W, H), Image.LANCZOS)
-        all_px = list(img.getdata())
-
-        corners = [all_px[0], all_px[W - 1], all_px[(H - 1) * W], all_px[H * W - 1]]
-        bg = tuple(sum(c[ch] for c in corners) // 4 for ch in range(3))
-
-        if region == "upper":
-            row_pixels = all_px[: int(H * 0.7) * W]
-        elif region == "lower":
-            row_pixels = all_px[int(H * 0.3) * W :]
-        else:
-            row_pixels = all_px
-
-        col_start = W // 5
-        col_end   = W - W // 5
-        h_rows    = len(row_pixels) // W
-        pixels = [
-            row_pixels[row * W + col]
-            for row in range(h_rows)
-            for col in range(col_start, col_end)
-        ]
-
-        counts: dict[str, int] = {}
-        for r, g, b in pixels:
-            if abs(r - bg[0]) + abs(g - bg[1]) + abs(b - bg[2]) < 60:
-                continue
-            if r > 220 and g > 220 and b > 220:
-                continue
-            name = _classify_pixel(r, g, b)
-            counts[name] = counts.get(name, 0) + 1
-
-        if not counts:
-            for r, g, b in pixels:
-                name = _classify_pixel(r, g, b)
-                counts[name] = counts.get(name, 0) + 1
-
-        total_fg = sum(counts.values())
-        best     = max(counts, key=lambda k: counts[k])
-        return best
-    except Exception:
-        return None
-
-
-# ── Persistent thread pool ────────────────────────────────────────────────────
-_executor = ThreadPoolExecutor(max_workers=32)
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _pid(raw_path: str) -> str:
@@ -208,29 +105,22 @@ def _image_url(pid: str, raw_path: str) -> str:
     return f"{R2_BASE_URL}/{pid}.jpg"
 
 
-def _build_result(faiss_idx: int, color: str | None = None) -> dict:
-    """Turn a FAISS index row into a product dict. Color is pre-computed."""
-    raw_path = str(paths[faiss_idx])
-    pid      = _pid(raw_path)
-    meta     = url_map.get(pid, {})
-    dtags    = design_tags.get(pid, {})
-    result = {
+def _build_result(faiss_idx: int) -> dict:
+    """Turn a FAISS index row into a product dict."""
+    raw_path   = str(paths[faiss_idx])
+    pid        = _pid(raw_path)
+    meta       = url_map.get(pid, {})
+    dtags      = design_tags.get(pid, {})
+    tag_colors = dtags.get("color", [])
+    return {
         "id":        pid,
         "image_url": _image_url(pid, raw_path),
         "name":      meta.get("name") or f"Item {pid}",
         "price":     meta.get("price"),
         "link":      meta.get("link"),
-        "color":     color or meta.get("color"),
-        "tags": dict(dtags),
+        "color":     tag_colors[0] if tag_colors else meta.get("color"),
+        "tags":      dict(dtags),
     }
-    print(f"[_build_result] pid={pid} dtags_keys={list(dtags.keys())} tags={result['tags']}")
-    return result
-
-
-def _parallel_colors(indices: list[int], region: str) -> list[str | None]:
-    """Detect dominant colour for a list of FAISS indices in parallel."""
-    filenames = [Path(str(paths[i])).name for i in indices]
-    return list(_executor.map(lambda f: _compute_color(f, region), filenames))
 
 
 # ── Search strategies ─────────────────────────────────────────────────────────
@@ -239,7 +129,6 @@ def _semantic_search(query: str, k: int, filters: dict | None = None) -> list[di
     """Encode the query with CLIP and return top-k FAISS nearest neighbours,
     optionally filtered by design_tags constraints."""
     import clip as openai_clip
-    region    = _query_region(query)
     tokens    = openai_clip.tokenize([query]).to(clip_device)
     with __import__("torch").no_grad():
         feat  = clip_model.encode_text(tokens)
@@ -264,9 +153,8 @@ def _semantic_search(query: str, k: int, filters: dict | None = None) -> list[di
         ranked_pids = _filter_by_tags(ranked_pids, filters)
 
     ranked_pids = ranked_pids[:k]
-    valid  = [pid_to_idx[p] for p in ranked_pids]
-    colors = _parallel_colors(valid, region)
-    return [_build_result(idx, col) for idx, col in zip(valid, colors)]
+    valid = [pid_to_idx[p] for p in ranked_pids]
+    return [_build_result(idx) for idx in valid]
 
 
 def _image_search(image_url: str, k: int, exclude_pid: str | None = None) -> list[dict]:
@@ -319,15 +207,13 @@ def _image_search(image_url: str, k: int, exclude_pid: str | None = None) -> lis
         if len(valid) >= k:
             break
 
-    colors = _parallel_colors(valid, "full")
-    return [_build_result(idx, col) for idx, col in zip(valid, colors)]
+    return [_build_result(idx) for idx in valid]
 
 
 def _keyword_search(query: str, k: int) -> list[dict]:
     """Simple term-matching fallback (used when CLIP is unavailable)."""
-    region = _query_region(query)
-    terms  = query.lower().split()
-    valid  = []
+    terms = query.lower().split()
+    valid = []
     for i, raw_path in enumerate(paths):
         if len(valid) >= k: break
         pid  = _pid(str(raw_path))
@@ -337,8 +223,7 @@ def _keyword_search(query: str, k: int) -> list[dict]:
         ])).lower()
         if all(t in haystack for t in terms):
             valid.append(i)
-    colors = _parallel_colors(valid, region)
-    return [_build_result(idx, col) for idx, col in zip(valid, colors)]
+    return [_build_result(idx) for idx in valid]
 
 
 # ── Tag-based filtering ───────────────────────────────────────────────────────
@@ -797,14 +682,6 @@ def serve_image(filename):
         if img_path.exists():
             return send_file(str(img_path))
     return "Not found", 404
-
-
-# ── Warmup ────────────────────────────────────────────────────────────────────
-if CLIP_LOADED and len(paths) > 0:
-    print("[warmup] Warming up colour classifier …")
-    _warmup_files = [Path(str(p)).name for p in paths[:32]]
-    list(_executor.map(lambda f: _compute_color(f, "full"), _warmup_files))
-    print("[warmup] Colour classifier ready.")
 
 
 if __name__ == "__main__":
