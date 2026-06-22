@@ -213,6 +213,7 @@ def _build_result(faiss_idx: int, color: str | None = None) -> dict:
     raw_path = str(paths[faiss_idx])
     pid      = _pid(raw_path)
     meta     = url_map.get(pid, {})
+    dtags    = design_tags.get(pid, {})
     return {
         "id":        pid,
         "image_url": _image_url(pid, raw_path),
@@ -220,6 +221,15 @@ def _build_result(faiss_idx: int, color: str | None = None) -> dict:
         "price":     meta.get("price"),
         "link":      meta.get("link"),
         "color":     color or meta.get("color"),
+        "tags": {
+            "category":     dtags.get("category"),
+            "product_type": dtags.get("product_type"),
+            "design":       dtags.get("design"),
+            "material":     dtags.get("material"),
+            "pattern":      dtags.get("pattern"),
+            "occasion":     dtags.get("occasion"),
+            "gender":       dtags.get("gender"),
+        } if dtags else {},
     }
 
 
@@ -617,6 +627,17 @@ def search_by_image():
         return jsonify({"error": "CLIP not available"}), 503
 
     results = _image_search(image_url, k, exclude_pid)
+
+    filters = {}
+    for param in ("category", "product_type", "pattern", "material", "occasion", "gender"):
+        val = request.args.get(param, "").strip()
+        if val:
+            filters[param] = val
+    if filters and design_tags:
+        pids = [r["id"] for r in results]
+        filtered_pids = set(_filter_by_tags(pids, filters))
+        results = [r for r in results if r["id"] in filtered_pids]
+
     print(f"  → returned {len(results)} results")
     if results:
         print(f"  → top 3 ids: {[r['id'] for r in results[:3]]}")
