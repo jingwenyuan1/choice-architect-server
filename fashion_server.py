@@ -214,7 +214,7 @@ def _build_result(faiss_idx: int, color: str | None = None) -> dict:
     pid      = _pid(raw_path)
     meta     = url_map.get(pid, {})
     dtags    = design_tags.get(pid, {})
-    return {
+    result = {
         "id":        pid,
         "image_url": _image_url(pid, raw_path),
         "name":      meta.get("name") or f"Item {pid}",
@@ -223,6 +223,8 @@ def _build_result(faiss_idx: int, color: str | None = None) -> dict:
         "color":     color or meta.get("color"),
         "tags": dict(dtags),
     }
+    print(f"[_build_result] pid={pid} dtags_keys={list(dtags.keys())} tags={result['tags']}")
+    return result
 
 
 def _parallel_colors(indices: list[int], region: str) -> list[str | None]:
