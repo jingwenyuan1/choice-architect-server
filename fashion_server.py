@@ -681,50 +681,34 @@ def _match_tag(tags: dict, key: str, value: str) -> bool:
     return False
 
 
-# Relaxation order: drop least-specific constraints first.
-_RELAX_ORDER = [
-    "gender", "occasion", "color", "pattern", "material",
-    "design.sleeve_length", "design.heel_height", "design.heel_type",
-    "design.fit", "design.length", "design.neckline", "design.rise",
-    "category", "product_type",
-]
+def _filter_by_tags(pids: list[str], filters: dict[str, str]) -> list[str]:
+    """Return pids that satisfy ALL filters, preserving CLIP rank order.
 
-
-def _filter_by_tags(pids: list[str], filters: dict[str, str],
-                    min_results: int = 10) -> list[str]:
-    """Return pids matching all active filters, preserving CLIP rank order.
-
-    If strict filtering yields fewer than min_results, constraints are relaxed
-    one by one (least-specific first) until the threshold is met.
-    Products absent from design_tags are excluded (no tag data → can't verify).
+    Products absent from design_tags are excluded (can't verify their tags).
+    If zero products pass (most likely design_tags not loaded or PID mismatch),
+    falls back to the unfiltered pool so the page isn't blank.
     """
-    if not filters or not design_tags:
+    if not filters:
+        return pids
+    if not design_tags:
+        print(f"[filter] WARNING: design_tags is empty — filter skipped. "
+              f"Check that design_tags.json loaded at startup.")
         return pids
 
-    def _apply(pid_list: list[str], active: dict) -> list[str]:
-        out = []
-        for pid in pid_list:
-            tags = design_tags.get(pid)
-            if not tags or not isinstance(tags, dict):
-                continue
-            if all(_match_tag(tags, k, v) for k, v in active.items()):
-                out.append(pid)
-        return out
-
-    result = _apply(pids, filters)
-    if len(result) >= min_results:
-        return result
-
-    active = dict(filters)
-    for relax_key in _RELAX_ORDER:
-        if relax_key not in active:
+    result = []
+    for pid in pids:
+        tags = design_tags.get(pid)
+        if not tags or not isinstance(tags, dict):
             continue
-        del active[relax_key]
-        result = _apply(pids, active)
-        if len(result) >= min_results or not active:
-            break
+        if all(_match_tag(tags, k, v) for k, v in filters.items()):
+            result.append(pid)
 
-    return result if result else pids[:min_results]
+    print(f"[filter] filters={filters} → {len(result)}/{len(pids)} passed")
+
+    if not result:
+        print(f"[filter] zero strict matches — returning unfiltered pool as fallback")
+        return pids
+    return result
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -732,9 +716,10 @@ def _filter_by_tags(pids: list[str], filters: dict[str, str],
 @app.route("/health")
 def health():
     return jsonify({
-        "status":  "ok",
-        "indexed": int(index.ntotal),
-        "clip":    CLIP_LOADED,
+        "status":       "ok",
+        "indexed":      int(index.ntotal),
+        "clip":         CLIP_LOADED,
+        "design_tags":  len(design_tags),
     })
 
 
@@ -748,6 +733,7 @@ def search():
 
     # Parse filters from query text, then let explicit params override
     filters = _parse_query_filters(query)
+    print(f"[search] query={query!r} → detected filters={filters}")
     for param in ("category", "product_type", "pattern", "material", "occasion", "gender"):
         val = request.args.get(param, "").strip()
         if val:
