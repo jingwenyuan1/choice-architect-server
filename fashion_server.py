@@ -225,6 +225,7 @@ def _build_result(faiss_idx: int, color: str | None = None) -> dict:
             "category":     dtags.get("category"),
             "product_type": dtags.get("product_type"),
             "design":       dtags.get("design"),
+            "color":        dtags.get("color"),
             "material":     dtags.get("material"),
             "pattern":      dtags.get("pattern"),
             "occasion":     dtags.get("occasion"),
