@@ -600,6 +600,12 @@ def _filter_by_tags(pids: list[str], filters: dict[str, str]) -> list[str]:
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+@app.route("/tags")
+def get_tags():
+    pids = [p.strip() for p in request.args.get("pids", "").split(",") if p.strip()]
+    return jsonify({pid: design_tags.get(pid, {}) for pid in pids})
+
+
 @app.route("/health")
 def health():
     return jsonify({
